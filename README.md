@@ -18,7 +18,8 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Automated CPU vs GPU validation (PASS/FAIL)
 - [x] Stress-tested at 4096×4096 (~16.7M parameters)
 - [x] Isolated GPU setup vs compute timing
-- [ ] Load real weights from Hugging Face
+- [x] Real AI weights from Hugging Face (`microsoft/bitnet-b1.58-2B-4T`)
+- [ ] Tokenizer integration for text-in → text-out inference
 
 ## How It Works
 
@@ -56,6 +57,15 @@ For matrix-vector multiplication, input tiles are cached in
 `var<workgroup>` shared memory. Each workgroup computes one output row,
 and a reduction across the workgroup produces the final dot product.
 
+### Real AI weight integration
+
+The `extract_weights.py` script downloads pre-trained weights from
+[`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
+on Hugging Face. The model stores weights as row-packed `uint8` tensors
+(4 ternary values per byte). The script unpacks these, then re-packs into
+our kernel's column-packed `uint32` format (16 weights per `u32`) and saves
+a binary `.bin` file that the browser can `fetch()` directly into GPU buffers.
+
 ## Quick Start
 
 1. **Clone the repo**
@@ -71,34 +81,72 @@ and a reduction across the workgroup produces the final dot product.
 
 3. **Open in a WebGPU-capable browser** (Chrome 113+, Edge 113+, Safari 18+)
    
-   Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results.
+   Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results. Tests 1 and 2 run CPU-vs-GPU validation with synthetic data. Test 3 runs a real AI weight matrix through the WebGPU kernel.
+
+## Extracting Real AI Weights (Optional)
+
+To reproduce the real-weight integration (Test 3), you need Python 3.10+ and a Hugging Face account:
+
+1. **Install Python dependencies**
+   ```bash
+   pip install torch safetensors huggingface-hub numpy
+   ```
+
+2. **Run the extraction script**
+   ```bash
+   python extract_weights.py
+   ```
+   This will:
+   - Download `microsoft/bitnet-b1.58-2B-4T` (~1.1 GB safetensors file)
+   - Extract `model.layers.0.mlp.down_proj.weight` (2560 × 6912 ternary matrix)
+   - Unpack the HF row-packed `uint8` format (4 weights/byte)
+   - Re-pack into our JS kernel's column-packed `uint32` format (16 weights/u32)
+   - Save `bitnet_layer_0_down_proj.bin` (4.2 MB)
+
+3. **Serve and test** — the `.bin` file must be in the same directory as `index.html`:
+   ```bash
+   npx serve . -l 8080
+   ```
 
 ## Latest Benchmark Results
 
-2D tiled mat-vec at **4096×4096** (~16.7M ternary parameters), bit-packed to 4 MB (93.8% smaller than unpacked).
+### Test 2: Synthetic 4096×4096 mat-vec (CPU vs GPU validation)
 
-| Metric | iPad Air M3 | MacBook M2 Max |
-|--------|-------------|----------------|
-| CPU mat-vec | 71 ms | 94 ms |
-| GPU setup | 73 ms | 98.2 ms |
-| GPU compute | **7 ms** | **4.1 ms** |
-| Speedup | **10.1×** | **22.9×** |
-| Max error | 2.08e-3 | 2.08e-3 |
+| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
+|--------|-------------------|-------------|----------------|
+| CPU mat-vec | 78 ms | 71 ms | 93 ms |
+| GPU setup | 84 ms | 73 ms | 98 ms |
+| GPU compute | **50 ms** | **24 ms** | **3.1 ms** |
+| Speedup | **1.6×** | **3.0×** | **30.1×** |
+| Max error | 2.08e-3 | 2.08e-3 | 2.08e-3 |
+
+### Test 3: Real AI weights — `microsoft/bitnet-b1.58-2B-4T`
+
+Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
+
+| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
+|--------|-------------------|-------------|----------------|
+| GPU setup | 2 ms | 1 ms | 1.4 ms |
+| GPU compute | **13 ms** | **7 ms** | **4.8 ms** |
+| Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
+| Result | ✅ PASS | ✅ PASS | ✅ PASS |
 
 **Key takeaways:**
 
-- **The timing split paid off.** Setup cost (buffers + pipeline compile) dominates total GPU time at ~73–98 ms, but the raw compute is only 4–7 ms for 16.7M ternary parameters. Without the split, the GPU would have looked slower than CPU.
-- **M2 Max is ~1.7× faster on compute** than M3 (4.1 ms vs 7 ms), which tracks with its 30-core vs 10-core GPU advantage and higher memory bandwidth (400 GB/s vs ~150 GB/s).
-- **M3 has faster CPU single-thread** (71 ms vs 94 ms), consistent with its newer core architecture despite fewer cores.
-- **Numerical precision is identical** across both devices — max error of 2.08e-3 at the same row (496), confirming deterministic f32 accumulation behavior across Apple GPU generations.
-- **Setup cost is a one-time expense** in a real inference pipeline — the pipeline and buffers would be reused across tokens, so the 4–7 ms compute time is the number that matters for throughput.
+- **Real AI weights work end-to-end.** Pre-trained ternary weights from Hugging Face are extracted, bit-packed, fetched by the browser, and processed by the WebGPU kernel — producing non-trivial output on all three devices.
+- **M2 Max dominates on compute** at 3.1 ms (Test 2) and 4.8 ms (Test 3), benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
+- **Even an iPhone processes a real 17.7M-parameter layer in 13 ms** — well within interactive latency requirements.
+- **Setup cost is a one-time expense** — the pipeline and buffers would be reused across tokens in a real inference loop, so the compute time is what matters for throughput.
+- **Numerical precision is identical** across all three Apple GPU generations — max error of 2.08e-3 at the same row, confirming deterministic f32 accumulation.
 
 ## Project Structure
 
 | File | Description |
 |------|-------------|
 | `index.html` | Minimal page that loads the kernel as an ES module |
-| `bitnet-kernel.js` | WebGPU setup, WGSL shader, buffer management, and result display |
+| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, buffer management, and result display |
+| `extract_weights.py` | Python script to extract and bit-pack weights from Hugging Face |
+| `bitnet_layer_0_down_proj.bin` | Pre-packed weight binary for Test 3 (generated by `extract_weights.py`) |
 | `package.json` | Project metadata |
 
 ## License
