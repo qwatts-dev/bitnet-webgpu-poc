@@ -544,6 +544,101 @@ async function run2DKernel(device, weightMatrix, inputVec, M, K) {
   return { results, setupMs, computeMs, packed, packedStride };
 }
 
+/**
+ * run2DKernelPacked – same as run2DKernel but accepts pre-packed
+ * Uint32Array weights directly (no JS-side packing step).
+ */
+async function run2DKernelPacked(device, packedWeights, inputVec, M, K) {
+  const packedStride = Math.ceil(K / 16);
+  const setupT0 = performance.now();
+
+  // ── Buffers ──
+  const inputBuf = device.createBuffer({
+    label: "2d-input",
+    size:  K * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(inputBuf, 0, new Float32Array(inputVec));
+
+  const weightBuf = device.createBuffer({
+    label: "2d-packed-weights",
+    size:  packedWeights.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(weightBuf, 0, packedWeights);
+
+  const resultBuf = device.createBuffer({
+    label: "2d-result",
+    size:  M * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  const stagingBuf = device.createBuffer({
+    label: "2d-staging",
+    size:  M * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const uniformBuf = device.createBuffer({
+    label: "2d-params",
+    size:  16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(
+    uniformBuf,
+    0,
+    new Uint32Array([M, K, packedStride, 0]),
+  );
+
+  // ── Pipeline ──
+  const module   = device.createShaderModule({ code: SHADER_2D_TILED });
+  const bgl      = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    compute: { module, entryPoint: "main" },
+  });
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: weightBuf } },
+      { binding: 2, resource: { buffer: resultBuf } },
+      { binding: 3, resource: { buffer: uniformBuf } },
+    ],
+  });
+
+  const setupMs = performance.now() - setupT0;
+
+  // ── Dispatch: one workgroup per row ──
+  const computeT0 = performance.now();
+  const encoder   = device.createCommandEncoder();
+  const pass      = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(M);
+  pass.end();
+  encoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, M * 4);
+  device.queue.submit([encoder.finish()]);
+
+  await stagingBuf.mapAsync(GPUMapMode.READ);
+  const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
+  stagingBuf.unmap();
+
+  const computeMs = performance.now() - computeT0;
+
+  [inputBuf, weightBuf, resultBuf, stagingBuf, uniformBuf].forEach((b) =>
+    b.destroy(),
+  );
+  return { results, setupMs, computeMs, packedStride };
+}
+
 // ════════════════════════════════════════════════
 // 9. Validation
 // ════════════════════════════════════════════════
@@ -743,6 +838,89 @@ async function main() {
       `GPU = ${gpuResult2D[v2.idx]}`,
       "fail",
     );
+  }
+  log("");
+
+  // ─────────────────────────────────────────────
+  // TEST 3 – Real AI Weights Integration
+  // ─────────────────────────────────────────────
+
+  const M3 = 2560;
+  const K3 = 6912;
+
+  log(`━━━ Test 3: Real AI Weights – microsoft/bitnet-b1.58-2B-4T ━━━`);
+  log(`  Layer: model.layers.0.mlp.down_proj  (${M3} × ${K3})`);
+  log("");
+
+  try {
+    // Fetch pre-packed binary weights
+    log("  Fetching bitnet_layer_0_down_proj.bin ...");
+    const resp = await fetch("bitnet_layer_0_down_proj.bin");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    const buf  = await resp.arrayBuffer();
+    const packedReal = new Uint32Array(buf);
+
+    const expectedStride = Math.ceil(K3 / 16);
+    const expectedLen    = M3 * expectedStride;
+    log(`  Loaded ${packedReal.length.toLocaleString()} u32 words ` +
+        `(${packedReal.byteLength.toLocaleString()} bytes)`, "info");
+    log(`  Expected: ${expectedLen.toLocaleString()} u32 words ` +
+        `(${M3} rows × ${expectedStride} stride)`, "info");
+    if (packedReal.length !== expectedLen) {
+      throw new Error(
+        `Size mismatch: got ${packedReal.length}, expected ${expectedLen}`,
+      );
+    }
+    log("");
+
+    // Create mock input vector (random floats in [-1, 1])
+    const mockInput = new Float32Array(K3);
+    for (let i = 0; i < K3; i++) {
+      mockInput[i] = Math.random() * 2 - 1;
+    }
+    log(`  Mock input vector: ${K3} × f32 (random [-1, 1])`);
+    log("");
+
+    // Run on GPU with pre-packed weights
+    const {
+      results:   gpuResult3,
+      setupMs:   setupMs3,
+      computeMs: computeMs3,
+    } = await run2DKernelPacked(device, packedReal, mockInput, M3, K3);
+
+    log(`  GPU setup   : ${setupMs3.toFixed(3)} ms  (buffers + pipeline)`);
+    log(`  GPU compute : ${computeMs3.toFixed(3)} ms  (dispatch + readback)`);
+    log("");
+
+    // Print first 10 output values
+    log("  ┌───────┬──────────────────┐");
+    log("  │  Row  │    GPU Output     │");
+    log("  ├───────┼──────────────────┤");
+    for (let i = 0; i < 10; i++) {
+      const val = gpuResult3[i].toFixed(6).padStart(16);
+      log(`  │ ${String(i).padStart(5)} │ ${val} │`);
+    }
+    log("  │  ...  │       ...        │");
+    log("  └───────┴──────────────────┘");
+    log("");
+
+    // Quick sanity: check output isn't all zeros
+    let nonZero = 0;
+    for (let i = 0; i < gpuResult3.length; i++) {
+      if (gpuResult3[i] !== 0) nonZero++;
+    }
+    const pctNonZero = ((nonZero / gpuResult3.length) * 100).toFixed(1);
+    log(`  Output stats: ${nonZero.toLocaleString()} / ${gpuResult3.length.toLocaleString()} ` +
+        `non-zero values (${pctNonZero}%)`, "info");
+
+    if (nonZero > 0) {
+      log("  ✅ PASS – Real AI weights: GPU produced non-trivial output!", "pass");
+    } else {
+      log("  ⚠️  WARNING – All outputs are zero (unexpected)", "fail");
+    }
+  } catch (err) {
+    log(`  ❌ FAIL – Could not run real weights test: ${err.message}`, "fail");
+    log(`     Make sure bitnet_layer_0_down_proj.bin is served alongside index.html`, "info");
   }
   log("");
 
